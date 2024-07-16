@@ -18,6 +18,10 @@ api_key = os.environ.get('API_KEY')
 secret = os.environ.get('SECRET')
 password = os.environ.get('PASSWORD')
 
+# Trading configuration
+trade_amount_percent = os.environ.get('TRADE_AMOUNT_PERCENT')
+source_amount_low = os.environ.get('SOURCE_AMOUNT_LOW')
+
 # Database setup
 DB_NAME = 'trades.db'
 
@@ -103,78 +107,73 @@ async def fetch_and_copy_trades():
         await exchange.load_markets()
         logger.info("Connected successfully. Fetching trades...")
 
-        while True:
+        usdt_balance = await get_usdt_balance(exchange)
+
+        account = await exchange.fetch_accounts()
+        print(f"Account: {account}")
+
+        trades = await exchange.fetch_my_trades(symbol=None, since=None, limit=10, params={})
+        
+        for trade in reversed(trades):
+            ord_id = trade['order']
+            
+            if is_trade_processed(ord_id):
+                continue  # Skip already processed trades
+            
+            logger.info(f"Processing trade: {trade}")
+
+            symbol = trade['symbol']
+            side = trade['side']
+            market = exchange.market(symbol)
+
+            if market['quote'] != 'USDT':
+                logger.warning(f"Skipping non-USDT market: {symbol}")
+                continue
+
             try:
-                usdt_balance = await get_usdt_balance(exchange)
-                order_amount_usdt = usdt_balance * 0.1  # 10% of available balance
+                if side == 'buy':
+                    price = trade['price']
+                    order_amount_usdt = usdt_balance * trade_amount_percent  # 10% of available balance
+                    
+                    # Put more if it's the biggest DCA order
+                    if (trade['cost'] > (source_amount_low * 1.5) ):
+                        order_amount_usdt = order_amount_usdt * 2
 
-                account = await exchange.fetch_accounts()
-                print(f"Account: {account}")
-
-                trades = await exchange.fetch_my_trades(symbol=None, since=None, limit=10, params={})
+                    amount = order_amount_usdt / price
+                    logger.info(f"Attempting to place new buy order for {amount} {symbol} (value: {order_amount_usdt} USDT)")
+                    new_order = await exchange.create_market_order(symbol, side, amount, params={'tdMode': 'spot_isolated'})
+                    logger.info(f"Placed new buy lead trade: {new_order}")
+                    # Mark the Lead trade as processed to ignore it in the future
+                    mark_trade_as_processed(new_order['id'], symbol, amount, side)
+                    update_holdings(symbol, amount, 'buy')
+                elif side == 'sell':
+                    amount = get_holding_amount(symbol)
+                    if amount > 0:
+                        logger.info(f"Attempting to sell all holdings of {symbol}: {amount}")
+                        margin_mode = await exchange.set_margin_mode('spot_isolated', symbol)
+                        logger.info(f"Margin mode: {margin_mode}")
+                        new_order = await exchange.create_market_order(symbol, side, amount, params={'tdMode': 'spot_isolated'})
+                        logger.info(f"Placed new sell lead trade: {new_order}")
+                        # Mark the Lead trade as processed to ignore it in the future
+                        mark_trade_as_processed(new_order['id'], symbol, amount, side)
+                        update_holdings(symbol, amount, 'sell')
+                    else:
+                        logger.info(f"No holdings to sell for {symbol}")
                 
-                for trade in reversed(trades):
-                    ord_id = trade['order']
-                    
-                    if is_trade_processed(ord_id):
-                        continue  # Skip already processed trades
-                    
-                    logger.info(f"Processing trade: {trade}")
-
-                    symbol = trade['symbol']
-                    side = trade['side']
-                    market = exchange.market(symbol)
-
-                    if market['quote'] != 'USDT':
-                        logger.warning(f"Skipping non-USDT market: {symbol}")
-                        continue
-
-                    try:
-                        if side == 'buy':
-                            price = trade['price']
-                            amount = order_amount_usdt / price
-                            logger.info(f"Attempting to place new buy order for {amount} {symbol} (value: {order_amount_usdt} USDT)")
-                            new_order = await exchange.create_market_order(symbol, side, amount, params={'tdMode': 'spot_isolated'})
-                            logger.info(f"Placed new buy lead trade: {new_order}")
-                            # Mark the Lead trade as processed to ignore it in the future
-                            mark_trade_as_processed(new_order['id'], symbol, amount, side)
-                            update_holdings(symbol, amount, 'buy')
-                        elif side == 'sell':
-                            amount_to_sell = get_holding_amount(symbol)
-                            if amount_to_sell > 0:
-                                logger.info(f"Attempting to sell all holdings of {symbol}: {amount_to_sell}")
-                                margin_mode = await exchange.set_margin_mode('spot_isolated', symbol)
-                                logger.info(f"Margin mode: {margin_mode}")
-                                new_order = await exchange.create_market_order(symbol, side, amount_to_sell, params={'tdMode': 'spot_isolated'})
-                                logger.info(f"Placed new sell lead trade: {new_order}")
-                                # Mark the Lead trade as processed to ignore it in the future
-                                mark_trade_as_processed(new_order['id'], symbol, amount_to_sell, side)
-                                update_holdings(symbol, amount_to_sell, 'sell')
-                            else:
-                                logger.info(f"No holdings to sell for {symbol}")
-                        
-                        mark_trade_as_processed(ord_id, symbol, amount, side)
-                    except ccxt.InsufficientFunds as e:
-                        logger.error(f"Insufficient funds to place order: {e}")
-                    except ccxt.ExchangeError as e:
-                        logger.error(f"Exchange error when placing order: {e}")
-                    except Exception as e:
-                        logger.error(f"Unexpected error placing new trade: {e}")
-
-                await asyncio.sleep(10)  # Adjust based on your needs and API rate limits
-
-            except ccxt.NetworkError as e:
-                logger.error(f"Network error: {e}. Retrying in 5 seconds...")
-                await asyncio.sleep(5)
+                mark_trade_as_processed(ord_id, symbol, amount, side)
+            except ccxt.InsufficientFunds as e:
+                logger.error(f"Insufficient funds to place order: {e}")
             except ccxt.ExchangeError as e:
-                logger.error(f"Exchange error: {e}. Retrying in 5 seconds...")
-                await asyncio.sleep(5)
+                logger.error(f"Exchange error when placing order: {e}")
             except Exception as e:
-                logger.error(f"Unexpected error: {e}. Retrying in 5 seconds...")
-                await asyncio.sleep(5)
+                logger.error(f"Unexpected error placing new trade: {e}")
 
-    except KeyboardInterrupt:
-        logger.info("Stopping the trade fetcher...")
+    except ccxt.NetworkError as e:
+        logger.error(f"Network error: {e}")
+    except ccxt.ExchangeError as e:
+        logger.error(f"Exchange error: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
     finally:
         await exchange.close()
 
